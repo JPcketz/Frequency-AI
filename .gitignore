@@ -1,0 +1,64 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.egg-info/
+build/
+dist/
+
+# --- Environments / secrets ---
+.venv/
+venv/
+.env
+.env.*
+.envrc
+
+# --- Editors/IDEs ---
+.vscode/
+.idea/
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- Logs & temp ---
+logs/
+*.log
+tmp/
+.cache/
+wandb/
+mlruns/
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Datasets & renders (keep repo lean) ---
+data/
+datasets/
+renders/
+stems/
+outputs/
+results/
+
+# Common audio (ignore by default; we’ll export artifacts instead)
+*.wav
+*.aiff
+*.aif
+*.flac
+*.mp3
+*.ogg
+*.m4a
+
+# --- Models / checkpoints ---
+checkpoints/
+models/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# --- Instrument samples (allow small text presets later) ---
+synthesis/instruments/samples/
