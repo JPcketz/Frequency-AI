@@ -2,17 +2,20 @@ import re
 import json
 import csv
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Mapping, Any
 
 import click
 from rich import print
 from rich.console import Console
 from rich.table import Table
 
-# Imports for MIDI + groove
+# MIDI + groove
 from .inference.generate import anchor_to_demo_melody
 from .export.midi_export import write_melody_midi
 from .inference.groove_imposer import extract_groove_template, impose_groove_on_events
+
+# NEW: config support
+from .config import load_yaml_config, deep_merge
 
 console = Console()
 
@@ -126,9 +129,11 @@ def main():
     pass
 
 @main.command("generate")
-@click.option("--key", required=True, help="Musical key (e.g., C, D#, F#, Bb).")
-@click.option("--mode", required=True, help="Mode (major/minor or modal: dorian, lydian, etc.)")
-@click.option("--bpm", type=int, required=True, help="Tempo in beats per minute.")
+@click.option("--config", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
+              help="YAML config preset. CLI flags override config values.")
+@click.option("--key", required=False, help="Musical key (e.g., C, D#, F#, Bb).")
+@click.option("--mode", required=False, help="Mode (major/minor or modal: dorian, lydian, etc.)")
+@click.option("--bpm", type=int, required=False, help="Tempo in beats per minute.")
 @click.option("--anchor", default="", help='4-bar chord progression, e.g. "Am-G-C-F"')
 @click.option("--anchor-bars", type=int, default=4, show_default=True, help="Bars covered by the anchor progression.")
 @click.option("--groove", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
@@ -136,7 +141,7 @@ def main():
 @click.option("--quantize", default="1/16", show_default=True, help="Groove grid (e.g., 1/8, 1/16).")
 @click.option("--humanize", type=float, default=12.0, show_default=True, help="Max micro-timing shift (ms).")
 @click.option("--instruments", default="", help='Comma-separated ≤4 instruments, e.g. "analog_bass,e_gtr_bigverb,jazz_kit,cin_pad"')
-@click.option("--length", required=True, help='Total length (e.g., 60s, 1:00, 1m30s).')
+@click.option("--length", required=False, help='Total length (e.g., 60s, 1:00, 1m30s).')
 @click.option("--marker", multiple=True, help='Repeatable: "time:label" (e.g., 30:motif or 00:45:filter_sweep).')
 @click.option("--stems/--no-stems", default=False, help="Export per-instrument stems (when audio is implemented).")
 @click.option("--midi/--no-midi", default=False, help="Export MIDI (demo via anchor for now).")
@@ -144,38 +149,78 @@ def main():
 @click.option("--csv-structure/--no-csv-structure", default=False, help="Export CSV of sections.")
 @click.option("--outdir", default="outputs", show_default=True, help="Directory for outputs.")
 @click.option("--outfile", default=None, help="Base filename (no extension). If omitted, a default is chosen.")
-def cmd_generate(key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
+def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
                  instruments, length, marker, stems, midi, wav, csv_structure, outdir, outfile):
-    """Plan a generation and optionally export a demo MIDI and structure CSV."""
-    # Validate key/mode
-    key = _canon_key(key)
-    mode = _canon_mode(mode)
+    """Plan a generation and optionally export a demo MIDI and structure CSV (config-aware)."""
+
+    # Load config (file path or FREQAI_CONFIG env) and merge with CLI (CLI wins)
+    cfg = load_yaml_config(config)
+    cli_args: Dict[str, Any] = {
+        "key": key, "mode": mode, "bpm": bpm,
+        "anchor": anchor, "anchor_bars": anchor_bars, "groove": str(groove) if groove else None,
+        "quantize": quantize, "humanize": humanize, "instruments": instruments,
+        "length": length, "marker": list(marker) if marker else None,
+        "stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure,
+        "outdir": outdir, "outfile": outfile,
+    }
+    # Drop Nones so config can supply defaults
+    cli_args = {k: v for k, v in cli_args.items() if v is not None and v != ""}
+    args = deep_merge(cfg, cli_args)
+
+    # --- Parse/validate merged args ---
+    if "key" not in args or "mode" not in args or "bpm" not in args or "length" not in args:
+        raise click.UsageError("Please specify --key, --mode, --bpm, and --length (either via CLI or --config).")
+
+    key = _canon_key(str(args["key"]))
+    mode = _canon_mode(str(args["mode"]))
+    bpm = int(args["bpm"])
+    length = str(args["length"])
+    total_sec = _parse_duration(length)
+
+    instruments = _parse_instruments(str(args.get("instruments", "")))
+    anchor_chords = _parse_anchor(str(args.get("anchor", "")))
+    anchor_bars = int(args.get("anchor_bars", 4))
+
+    groove_path = args.get("groove", None)
+    quantize = str(args.get("quantize", "1/16"))
+    humanize = float(args.get("humanize", 12.0))
     if quantize not in QUANTIZE_ALLOWED:
         raise click.BadParameter(f"quantize must be one of {sorted(QUANTIZE_ALLOWED)}")
 
-    insts = _parse_instruments(instruments)
-    anchor_chords = _parse_anchor(anchor)
-    total_sec = _parse_duration(length)
-    markers = _parse_markers(marker) if marker else []
+    markers_arg = args.get("marker", [])
+    # allow markers list from YAML strings
+    if isinstance(markers_arg, (list, tuple)):
+        marker_tuple: Tuple[str, ...] = tuple(str(x) for x in markers_arg)
+    elif isinstance(markers_arg, str) and markers_arg:
+        marker_tuple = (markers_arg,)
+    else:
+        marker_tuple = tuple()
+    markers = _parse_markers(marker_tuple) if marker_tuple else []
+
+    stems = bool(args.get("stems", False))
+    midi = bool(args.get("midi", False))
+    wav = bool(args.get("wav", False))
+    csv_structure = bool(args.get("csv_structure", False))
+    outdir = str(args.get("outdir", "outputs"))
+    outfile = args.get("outfile", None)
 
     plan = {
         "controls": {
             "key": key, "mode": mode, "bpm": bpm,
             "anchor": anchor_chords, "anchor_bars": anchor_bars,
-            "groove_midi": str(groove) if groove else None,
+            "groove_midi": groove_path,
             "quantize": quantize, "humanize_ms": humanize,
-            "instruments": insts,
+            "instruments": instruments,
             "length_sec": total_sec,
             "markers": [{"time_sec": t, "label": lab} for t, lab in markers],
-            "exports": {
-                "stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure
-            }
+            "exports": {"stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure}
         },
         "structure": _propose_sections(total_sec),
         "notes": [
             "This is a dry-run. Audio coming in later milestones.",
             "MIDI demo uses the anchor: one sustained root note per bar.",
-            "If --groove is provided, micro-timing is imposed from the reference loop."
+            "If --groove or groove: is provided, micro-timing is imposed from the reference loop.",
+            "Config precedence: CLI overrides config file; env FREQAI_CONFIG is used if --config is omitted."
         ]
     }
 
@@ -213,13 +258,13 @@ def cmd_generate(key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize
     # MIDI export (anchor → events → optional groove → MIDI)
     if midi:
         if not anchor_chords:
-            console.print("[yellow]--midi requested but no --anchor provided; skipping MIDI demo.[/yellow]")
+            console.print("[yellow]--midi requested but no anchor provided; skipping MIDI demo.[/yellow]")
         else:
             events = anchor_to_demo_melody(anchor_chords)
-            if groove:
-                tpl = extract_groove_template(str(groove), quantize=quantize)
+            if groove_path:
+                tpl = extract_groove_template(str(groove_path), quantize=quantize)
                 events = impose_groove_on_events(events, bpm=bpm, template=tpl, max_ms=humanize)
-                console.print(f"[cyan]Applied groove from[/cyan] {groove} [cyan]({quantize}, ±{humanize}ms)[/cyan]")
+                console.print(f"[cyan]Applied groove from[/cyan] {groove_path} [cyan]({quantize}, ±{humanize}ms)[/cyan]")
             base = outfile or "demo_anchor"
             midi_path = outdir_path / f"{base}.mid"
             write_melody_midi(events, bpm=bpm, out_path=str(midi_path), instrument_name="anchor_demo", program=0)
