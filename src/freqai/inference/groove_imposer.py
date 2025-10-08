@@ -56,7 +56,7 @@ def extract_groove_template(midi_path: str, quantize: str = "1/16") -> Dict[str,
     """
     steps = _grid_steps(quantize)
     pm = pretty_midi.PrettyMIDI(midi_path)
-    beat_times = pm.get_beats()
+    beat_times = pm.get_beats().tolist()
     if len(beat_times) < 2:
         # Fallback tempo estimate if no beats detected
         tempo = pm.estimate_tempo()
