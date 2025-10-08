@@ -1,5 +1,6 @@
 import re
 import json
+import csv
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
@@ -7,6 +8,9 @@ import click
 from rich import print
 from rich.console import Console
 from rich.table import Table
+
+# NEW: hook up the demo MIDI writer
+from .inference.generate import write_anchor_demo_midi
 
 console = Console()
 
@@ -29,9 +33,11 @@ QUANTIZE_ALLOWED = {"1/4","1/8","1/12","1/16","1/24","1/32"}
 
 def _canon_key(k: str) -> str:
     k = k.strip().replace("♯","#").replace("♭","b")
-    k = k.upper()
-    if k in {"DB","EB","GB","AB","BB"}:  # normalize flat caps to title-case
-        k = k[0] + "b"
+    # Keep case like "Bb" not "BB"
+    if len(k) >= 2 and k[1] in {"b","#"}:
+        k = k[0].upper() + k[1]
+    else:
+        k = k.upper()
     if k not in KEYS:
         raise click.BadParameter(f"Unsupported key '{k}'. Try one of: {sorted(KEYS)}")
     return k
@@ -40,7 +46,7 @@ def _canon_mode(m: str) -> str:
     m = m.strip().lower()
     if m not in MODE_ALIASES:
         raise click.BadParameter(
-            f"Unsupported mode '{m}'. Try one of: major, minor, dorian, phrygian, lydian, mixolydian, aeolian, ionian, locrian"
+            "Unsupported mode '{m}'. Try: major, minor, dorian, phrygian, lydian, mixolydian, aeolian, ionian, locrian"
         )
     return MODE_ALIASES[m]
 
@@ -72,8 +78,7 @@ def _parse_duration(s: str) -> int:
         return int(s[:-1])
     m = re.fullmatch(r"(\d+)m(?:(\d+)s)?", s)
     if m:
-        mins = int(m.group(1))
-        secs = int(m.group(2) or 0)
+        mins = int(m.group(1)); secs = int(m.group(2) or 0)
         return mins*60 + secs
     m = re.fullmatch(r"(\d+):([0-5]\d)", s)
     if m:
@@ -100,7 +105,6 @@ def _parse_markers(markers: Tuple[str]) -> List[Tuple[int, str]]:
         else:
             raise click.BadParameter(f"Bad time format in marker '{m}'")
         out.append((t, label))
-    # sort by time
     out.sort(key=lambda x: x[0])
     return out
 
@@ -124,7 +128,7 @@ def _propose_sections(total_sec: int) -> List[Dict]:
     sections = []
     for i in range(len(names)):
         s, e = cuts[i], cuts[i+1]
-        if e - s <= 0:  # guard
+        if e - s <= 0:
             continue
         sections.append({"name": names[i], "start": s, "end": e})
     return sections
@@ -148,12 +152,14 @@ def main():
 @click.option("--length", required=True, help='Total length (e.g., 60s, 1:00, 1m30s).')
 @click.option("--marker", multiple=True, help='Repeatable: "time:label" (e.g., 30:motif or 00:45:filter_sweep).')
 @click.option("--stems/--no-stems", default=False, help="Export per-instrument stems (when audio is implemented).")
-@click.option("--midi/--no-midi", default=False, help="Export MIDI (when generation is implemented).")
+@click.option("--midi/--no-midi", default=False, help="Export MIDI (demo via anchor for now).")
 @click.option("--wav/--no-wav", default=False, help="Export final WAV (when audio is implemented).")
 @click.option("--csv-structure/--no-csv-structure", default=False, help="Export CSV of sections/chords/motifs.")
+@click.option("--outdir", default="outputs", show_default=True, help="Directory for outputs.")
+@click.option("--outfile", default=None, help="Base filename (no extension). If omitted, a default is chosen.")
 def cmd_generate(key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
-                 instruments, length, marker, stems, midi, wav, csv_structure):
-    """Plan a generation (no audio yet). Validates inputs and prints a structured plan."""
+                 instruments, length, marker, stems, midi, wav, csv_structure, outdir, outfile):
+    """Plan a generation and optionally export a demo MIDI and structure CSV."""
     # Validate key/mode
     key = _canon_key(key)
     mode = _canon_mode(mode)
@@ -181,8 +187,8 @@ def cmd_generate(key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize
         },
         "structure": _propose_sections(total_sec),
         "notes": [
-            "This is a dry-run. No audio is generated at M0.",
-            "Next milestones: symbolic generation (MIDI), groove imposition, then audio rendering."
+            "This is a dry-run. Audio coming in later milestones.",
+            "MIDI demo uses the anchor: one sustained root note per bar."
         ]
     }
 
@@ -203,6 +209,31 @@ def cmd_generate(key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize
         for t, lab in markers:
             mtab.add_row(_sec_to_mss(t), lab)
         console.print(mtab)
+
+    # Ensure output dir
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    # CSV export of sections
+    if csv_structure:
+        base = outfile or "structure"
+        csv_path = outdir_path / f"{base}.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["section","start_m:ss","end_m:ss","start_sec","end_sec"])
+            for s in plan["structure"]:
+                writer.writerow([s["name"], _sec_to_mss(s["start"]), _sec_to_mss(s["end"]), s["start"], s["end"]])
+        console.print(f"[green]Wrote[/green] CSV structure → {csv_path}")
+
+    # Demo MIDI from anchor (requires anchor)
+    if midi:
+        if not anchor_chords:
+            console.print("[yellow]--midi requested but no --anchor provided; skipping MIDI demo.[/yellow]")
+        else:
+            base = outfile or "demo_anchor"
+            midi_path = outdir_path / f"{base}.mid"
+            write_anchor_demo_midi(anchor_chords, bpm=bpm, out_path=str(midi_path))
+            console.print(f"[green]Wrote[/green] demo MIDI from anchor → {midi_path}")
 
     # Controls summary JSON
     console.rule("[bold]Controls")
