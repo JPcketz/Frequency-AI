@@ -1,0 +1,32 @@
+# Frequency AI preset (demo)
+key: D
+mode: dorian
+bpm: 112
+length: "1:00"
+
+# 4-bar harmonic anchor (used to make a demo MIDI for now)
+anchor: "Am-G-C-F"
+anchor_bars: 4
+
+# Optional groove: extracts micro-timing from this MIDI and imposes it
+groove: demo_anchor.mid
+quantize: "1/16"
+humanize: 12
+
+# Up to 4 instruments (labels only for now; audio later)
+instruments: "analog_bass,e_gtr_bigverb,jazz_kit,cin_pad"
+
+# Optional markers (time:label)
+marker:
+  - "00:30:intro_motif"
+  - "00:45:filter_sweep"
+
+# Exports for the MVP
+midi: true
+csv_structure: true
+stems: false
+wav: false
+
+# Output location
+outdir: outputs
+outfile: demo
