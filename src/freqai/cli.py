@@ -9,9 +9,8 @@ from rich import print
 from rich.console import Console
 from rich.table import Table
 
-# Symbolic generation (v0), drums, groove, exports
-from .inference.symbolic_v0 import generate_melody_bass
-from .inference.drums_v0 import generate_drums_v0
+# Generators
+from .inference.song_v0 import generate_song_v0           # <— NEW: full-song generator
 from .inference.groove_imposer import extract_groove_template, impose_groove_on_events
 from .export.midi_export import write_melody_midi, write_multitrack_midi
 from .synthesis.renderer import write_wav_from_events
@@ -88,7 +87,7 @@ def _parse_markers(markers: Tuple[str, ...]) -> List[Tuple[int, str]]:
     for m in markers:
         if ":" not in m:
             raise click.BadParameter(f"Marker '{m}' must be 'time:label' (e.g., 30:motif or 00:45:motif)")
-        # important: label after the LAST colon so times like 00:30 work
+        # use last colon so 00:30 works
         time_str, label = m.rsplit(":", 1)
         time_str, label = time_str.strip().lower(), label.strip()
         if time_str.endswith("s") or re.fullmatch(r"\d+:\d{2}", time_str) or time_str.isdigit():
@@ -121,7 +120,7 @@ def _propose_sections(total_sec: int) -> List[Dict[str, int]]:
 
 @click.group()
 def main():
-    """Frequency AI — CLI (M0: symbolic v0 + drums + groove + MIDI/WAV/STEMS)."""
+    """Frequency AI — CLI (song_v0 + drums + groove + MIDI/WAV/STEMS)."""
     pass
 
 @main.command("generate")
@@ -130,8 +129,8 @@ def main():
 @click.option("--key", required=False, help="Musical key (e.g., C, D#, F#, Bb).")
 @click.option("--mode", required=False, help="Mode (major/minor or modal: dorian, lydian, etc.)")
 @click.option("--bpm", type=int, required=False, help="Tempo in beats per minute.")
-@click.option("--anchor", default="", help='4-bar chord progression, e.g. "Am-G-C-F"')
-@click.option("--anchor-bars", type=int, default=4, show_default=True, help="Bars covered by the anchor progression.")
+@click.option("--anchor", default="", help='Chord progression seed, e.g. "Am-G-C-F" (tiled to song length).')
+@click.option("--anchor-bars", type=int, default=4, show_default=True, help="Bars covered by the anchor progression (seed length).")
 @click.option("--groove", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
               help="Path to a reference MIDI loop for groove extraction.")
 @click.option("--quantize", default="1/16", show_default=True, help="Groove grid (e.g., 1/8, 1/16).")
@@ -147,14 +146,14 @@ def main():
 @click.option("--csv-structure/--no-csv-structure", default=False, help="Export CSV of sections.")
 @click.option("--outdir", default="outputs", show_default=True, help="Directory for outputs.")
 @click.option("--outfile", default=None, help="Base filename (no extension). If omitted, a default is chosen.")
-@click.option("--waveform", type=click.Choice(["sine","saw","square","triangle","noise"]), default="saw", show_default=True,
+@click.option("--waveform", type=click.ice.Choice(["sine","saw","square","triangle","noise"]), default="saw", show_default=True,
               help="Waveform used for single-track WAV rendering.")
 @click.option("--sr", type=int, default=44100, show_default=True, help="Sample rate for WAV rendering.")
 @click.option("--gain", type=float, default=0.22, show_default=True, help="Output gain (0..1) for single-track WAV.")
 def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
                  instruments, length, marker, drums, stems, midi, wav, csv_structure, outdir, outfile,
                  waveform, sr, gain):
-    """Plan and export: symbolic_v0 (melody+bass) + optional drums → groove → MIDI/WAV/CSV/STEMS."""
+    """Plan and export: full-song (tiled from anchor) + optional drums → groove → MIDI/WAV/CSV/STEMS."""
 
     # Load config and merge with CLI (CLI wins)
     cfg = load_yaml_config(config)
@@ -212,7 +211,7 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
     sr = int(args.get("sr", 44100))
     gain = float(args.get("gain", 0.22))
 
-    # Plan
+    # Plan table
     plan = {
         "controls": {
             "key": key, "mode": mode, "bpm": bpm,
@@ -228,14 +227,12 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         },
         "structure": _propose_sections(total_sec),
         "notes": [
-            "symbolic_v0: key/mode-aware melody+bass over your anchor.",
-            "drums_v0: rock/pop kit (kick/snare/hat on 8ths).",
+            "song_v0 tiles your anchor to the requested length, then generates melody+bass (+drums).",
             "Groove (if provided) imposes micro-timing on all parts.",
-            "Single-track WAV uses one waveform for all parts; for best audio (esp. drums), use --stems."
+            "For best audio, use --stems (different waves per part + panning)."
         ]
     }
 
-    # Pretty tables
     table = Table(title="Planned Sections", show_lines=False)
     table.add_column("Section", no_wrap=True)
     table.add_column("Start", justify="right")
@@ -255,7 +252,7 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
     outdir_path = Path(outdir)
     outdir_path.mkdir(parents=True, exist_ok=True)
 
-    # CSV structure
+    # CSV structure (optional)
     if csv_structure:
         base = outfile or "structure"
         csv_path = outdir_path / f"{base}.csv"
@@ -266,23 +263,23 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
                 writer.writerow([s["name"], _sec_to_mss(s["start"]), _sec_to_mss(s["end"]), s["start"], s["end"]])
         console.print(f"[green]Wrote[/green] CSV structure → {csv_path}")
 
-    # === Generate parts ===
+    # === Generate FULL-SONG parts ===
     if not anchor_chords:
         console.print("[yellow]No --anchor provided; nothing to render/export.[/yellow]")
         return
 
-    parts = generate_melody_bass(anchor_chords, key=key, mode=mode)  # {"melody":[...], "bass":[...]}
-    if drums:
-        parts["drums"] = generate_drums_v0(anchor_chords)
+    parts = generate_song_v0(  # tiles anchor to song length under the hood
+        anchor_chords, key=key, mode=mode, length_sec=total_sec, bpm=bpm, include_drums=drums
+    )
 
-    # Apply groove per-part
+    # Apply groove per-part (if any)
     if groove_path:
         tpl = extract_groove_template(str(groove_path), quantize=quantize)
         for name, evs in list(parts.items()):
             parts[name] = impose_groove_on_events(evs, bpm=bpm, template=tpl, max_ms=humanize)
         console.print(f"[cyan]Applied groove from[/cyan] {groove_path} [cyan]({quantize}, ±{humanize}ms)[/cyan]")
 
-    # Flattened events for single-track exports
+    # Flattened events for single-track outputs
     events = [e for p in parts.values() for e in p]
 
     # MIDI export (single-track + multitrack)
@@ -290,16 +287,16 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         base = outfile or "demo"
         midi_path = outdir_path / f"{base}.mid"
         write_melody_midi(events, bpm=bpm, out_path=str(midi_path),
-                          instrument_name="melody_bass_drums_v0", program=0)
+                          instrument_name="song_v0_allparts", program=0)
         console.print(f"[green]Wrote[/green] MIDI (single-track) → {midi_path}")
 
         parts_mid_path = outdir_path / f"{base}.parts.mid"
         write_multitrack_midi(parts, bpm=bpm, out_path=str(parts_mid_path),
                               programs={"melody": 73, "bass": 34},
                               drum_flags={"drums": True})
-        console.print(f"[green]Wrote[/green] MIDI (multitrack: melody/bass{'+drums' if drums else ''}) → {parts_mid_path}")
+        console.print(f"[green]Wrote[/green] MIDI (multitrack) → {parts_mid_path}")
 
-    # WAV export (single-track quick render; for best quality, prefer --stems which mixes per-part)
+    # WAV export (single-track quick render)
     if wav:
         base = outfile or "demo"
         wav_path = outdir_path / f"{base}.wav"
@@ -313,7 +310,6 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
             "sr": sr,
             "defaults": {"wave": waveform, "gain": gain, "pan": 0.5},
             "per_part": {
-                # nicer defaults for stems
                 "melody": {"wave": "triangle", "gain": max(gain*1.0, 0.18), "pan": 0.65},
                 "bass":   {"wave": "saw",      "gain": max(gain*1.2, 0.24), "pan": 0.35},
                 "drums":  {"wave": "noise",    "gain": max(gain*0.7, 0.12), "pan": 0.50},
