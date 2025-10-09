@@ -9,12 +9,13 @@ from rich import print
 from rich.console import Console
 from rich.table import Table
 
-# Symbolic generation (v0), groove, exports
+# Symbolic generation (v0), drums, groove, exports
 from .inference.symbolic_v0 import generate_melody_bass
+from .inference.drums_v0 import generate_drums_v0
 from .inference.groove_imposer import extract_groove_template, impose_groove_on_events
 from .export.midi_export import write_melody_midi, write_multitrack_midi
 from .synthesis.renderer import write_wav_from_events
-from .export.stems import export_stems_and_mix  # <— NEW
+from .export.stems import export_stems_and_mix
 
 # Config support
 from .config import load_yaml_config, deep_merge
@@ -87,6 +88,7 @@ def _parse_markers(markers: Tuple[str, ...]) -> List[Tuple[int, str]]:
     for m in markers:
         if ":" not in m:
             raise click.BadParameter(f"Marker '{m}' must be 'time:label' (e.g., 30:motif or 00:45:motif)")
+        # important: label after the LAST colon so times like 00:30 work
         time_str, label = m.rsplit(":", 1)
         time_str, label = time_str.strip().lower(), label.strip()
         if time_str.endswith("s") or re.fullmatch(r"\d+:\d{2}", time_str) or time_str.isdigit():
@@ -119,7 +121,7 @@ def _propose_sections(total_sec: int) -> List[Dict[str, int]]:
 
 @click.group()
 def main():
-    """Frequency AI — CLI (M0: symbolic v0 + groove + MIDI/WAV/STEMS)."""
+    """Frequency AI — CLI (M0: symbolic v0 + drums + groove + MIDI/WAV/STEMS)."""
     pass
 
 @main.command("generate")
@@ -137,20 +139,22 @@ def main():
 @click.option("--instruments", default="", help='Comma-separated ≤4 instruments (labels only for now).')
 @click.option("--length", required=False, help='Total length (e.g., 60s, 1:00, 1m30s).')
 @click.option("--marker", multiple=True, help='Repeatable: "time:label" (e.g., 30:motif or 00:45:filter_sweep).')
-@click.option("--stems/--no-stems", default=False, help="Export per-instrument stems (melody/bass) and a stereo mix.")
-@click.option("--midi/--no-midi", default=False, help="Export MIDI (symbolic_v0 melody+bass).")
-@click.option("--wav/--no-wav", default=False, help="Export WAV (symbolic_v0 mix of parts).")
+@click.option("--drums/--no-drums", default=True, show_default=True,
+              help="Include a simple drum kit part (kick/snare/hat).")
+@click.option("--stems/--no-stems", default=False, help="Export per-part stems and a stereo mix.")
+@click.option("--midi/--no-midi", default=False, help="Export MIDI (single-track + multitrack).")
+@click.option("--wav/--no-wav", default=False, help="Export WAV (single-track quick render).")
 @click.option("--csv-structure/--no-csv-structure", default=False, help="Export CSV of sections.")
 @click.option("--outdir", default="outputs", show_default=True, help="Directory for outputs.")
 @click.option("--outfile", default=None, help="Base filename (no extension). If omitted, a default is chosen.")
 @click.option("--waveform", type=click.Choice(["sine","saw","square","triangle","noise"]), default="saw", show_default=True,
-              help="Waveform used for demo audio rendering.")
+              help="Waveform used for single-track WAV rendering.")
 @click.option("--sr", type=int, default=44100, show_default=True, help="Sample rate for WAV rendering.")
-@click.option("--gain", type=float, default=0.22, show_default=True, help="Output gain (0..1) for demo audio.")
+@click.option("--gain", type=float, default=0.22, show_default=True, help="Output gain (0..1) for single-track WAV.")
 def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
-                 instruments, length, marker, stems, midi, wav, csv_structure, outdir, outfile,
+                 instruments, length, marker, drums, stems, midi, wav, csv_structure, outdir, outfile,
                  waveform, sr, gain):
-    """Plan and export: symbolic_v0 (melody+bass) → optional groove → MIDI/WAV + CSV + STEMS."""
+    """Plan and export: symbolic_v0 (melody+bass) + optional drums → groove → MIDI/WAV/CSV/STEMS."""
 
     # Load config and merge with CLI (CLI wins)
     cfg = load_yaml_config(config)
@@ -159,7 +163,7 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         "anchor": anchor, "anchor_bars": anchor_bars, "groove": str(groove) if groove else None,
         "quantize": quantize, "humanize": humanize, "instruments": instruments,
         "length": length, "marker": list(marker) if marker else None,
-        "stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure,
+        "drums": drums, "stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure,
         "outdir": outdir, "outfile": outfile,
         "waveform": waveform, "sr": sr, "gain": gain,
     }
@@ -197,6 +201,7 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
     markers = _parse_markers(marker_tuple) if marker_tuple else []
 
     # Booleans & output
+    drums = bool(args.get("drums", True))
     stems = bool(args.get("stems", False))
     midi = bool(args.get("midi", False))
     wav = bool(args.get("wav", False))
@@ -212,6 +217,7 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         "controls": {
             "key": key, "mode": mode, "bpm": bpm,
             "anchor": anchor_chords, "anchor_bars": anchor_bars,
+            "drums": drums,
             "groove_midi": groove_path,
             "quantize": quantize, "humanize_ms": humanize,
             "instruments": instruments,
@@ -222,9 +228,10 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         },
         "structure": _propose_sections(total_sec),
         "notes": [
-            "symbolic_v0: key/mode-aware melody+bass over your anchor (quarter-note melody, half-note bass).",
-            "Groove (if provided) imposes micro-timing on parts.",
-            "Audio uses a placeholder synth; stems and mixdown available."
+            "symbolic_v0: key/mode-aware melody+bass over your anchor.",
+            "drums_v0: rock/pop kit (kick/snare/hat on 8ths).",
+            "Groove (if provided) imposes micro-timing on all parts.",
+            "Single-track WAV uses one waveform for all parts; for best audio (esp. drums), use --stems."
         ]
     }
 
@@ -259,44 +266,58 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
                 writer.writerow([s["name"], _sec_to_mss(s["start"]), _sec_to_mss(s["end"]), s["start"], s["end"]])
         console.print(f"[green]Wrote[/green] CSV structure → {csv_path}")
 
-    # === Generate symbolic_v0 parts ===
+    # === Generate parts ===
     if not anchor_chords:
         console.print("[yellow]No --anchor provided; nothing to render/export.[/yellow]")
         return
 
     parts = generate_melody_bass(anchor_chords, key=key, mode=mode)  # {"melody":[...], "bass":[...]}
+    if drums:
+        parts["drums"] = generate_drums_v0(anchor_chords)
 
-    # Apply groove per-part (so stems + mix share the same feel)
+    # Apply groove per-part
     if groove_path:
         tpl = extract_groove_template(str(groove_path), quantize=quantize)
         for name, evs in list(parts.items()):
             parts[name] = impose_groove_on_events(evs, bpm=bpm, template=tpl, max_ms=humanize)
         console.print(f"[cyan]Applied groove from[/cyan] {groove_path} [cyan]({quantize}, ±{humanize}ms)[/cyan]")
 
-    # Flattened events for single-track MIDI/WAV (kept for convenience)
-    events = parts["melody"] + parts["bass"]
+    # Flattened events for single-track exports
+    events = [e for p in parts.values() for e in p]
 
-    # MIDI export (single-track for now)
+    # MIDI export (single-track + multitrack)
     if midi:
         base = outfile or "demo"
         midi_path = outdir_path / f"{base}.mid"
-        write_melody_midi(events, bpm=bpm, out_path=str(midi_path), instrument_name="melody_bass_v0", program=0)
+        write_melody_midi(events, bpm=bpm, out_path=str(midi_path),
+                          instrument_name="melody_bass_drums_v0", program=0)
         console.print(f"[green]Wrote[/green] MIDI (single-track) → {midi_path}")
 
-        # NEW: multitrack MIDI (one track per part)
         parts_mid_path = outdir_path / f"{base}.parts.mid"
-        # General MIDI programs: 73=Flute (melody), 34=Electric Bass (finger)
         write_multitrack_midi(parts, bpm=bpm, out_path=str(parts_mid_path),
-                              programs={"melody": 73, "bass": 34})
-        console.print(f"[green]Wrote[/green] MIDI (multitrack: melody/bass) → {parts_mid_path}")
+                              programs={"melody": 73, "bass": 34},
+                              drum_flags={"drums": True})
+        console.print(f"[green]Wrote[/green] MIDI (multitrack: melody/bass{'+drums' if drums else ''}) → {parts_mid_path}")
+
+    # WAV export (single-track quick render; for best quality, prefer --stems which mixes per-part)
+    if wav:
+        base = outfile or "demo"
+        wav_path = outdir_path / f"{base}.wav"
+        write_wav_from_events(events, bpm=bpm, out_path=str(wav_path), sr=sr, wave=waveform, gain=gain)
+        console.print(f"[green]Wrote[/green] WAV ({waveform}, {sr} Hz) → {wav_path}")
 
     # STEMS export + stereo mixdown
     if stems:
         base = outfile or "demo"
         render_opts = {
             "sr": sr,
-            "defaults": {"wave": waveform, "gain": gain, "pan": 0.5},  # CLI waveform/gain apply unless per-part overrides
-            # per_part left to stems.py defaults (melody triangle @0.22/pan0.65; bass saw @0.28/pan0.35)
+            "defaults": {"wave": waveform, "gain": gain, "pan": 0.5},
+            "per_part": {
+                # nicer defaults for stems
+                "melody": {"wave": "triangle", "gain": max(gain*1.0, 0.18), "pan": 0.65},
+                "bass":   {"wave": "saw",      "gain": max(gain*1.2, 0.24), "pan": 0.35},
+                "drums":  {"wave": "noise",    "gain": max(gain*0.7, 0.12), "pan": 0.50},
+            },
         }
         result = export_stems_and_mix(parts, bpm=bpm, outdir=outdir_path, base=base, render_opts=render_opts)
         console.print(f"[green]Wrote[/green] stems & mix → {result['mix']}")
