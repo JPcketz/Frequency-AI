@@ -14,6 +14,7 @@ from .inference.symbolic_v0 import generate_melody_bass
 from .inference.groove_imposer import extract_groove_template, impose_groove_on_events
 from .export.midi_export import write_melody_midi
 from .synthesis.renderer import write_wav_from_events
+from .export.stems import export_stems_and_mix  # <— NEW
 
 # Config support
 from .config import load_yaml_config, deep_merge
@@ -118,7 +119,7 @@ def _propose_sections(total_sec: int) -> List[Dict[str, int]]:
 
 @click.group()
 def main():
-    """Frequency AI — CLI (M0: symbolic v0 + groove + MIDI/WAV)."""
+    """Frequency AI — CLI (M0: symbolic v0 + groove + MIDI/WAV/STEMS)."""
     pass
 
 @main.command("generate")
@@ -136,9 +137,9 @@ def main():
 @click.option("--instruments", default="", help='Comma-separated ≤4 instruments (labels only for now).')
 @click.option("--length", required=False, help='Total length (e.g., 60s, 1:00, 1m30s).')
 @click.option("--marker", multiple=True, help='Repeatable: "time:label" (e.g., 30:motif or 00:45:filter_sweep).')
-@click.option("--stems/--no-stems", default=False, help="(Future) Export per-instrument stems.")
+@click.option("--stems/--no-stems", default=False, help="Export per-instrument stems (melody/bass) and a stereo mix.")
 @click.option("--midi/--no-midi", default=False, help="Export MIDI (symbolic_v0 melody+bass).")
-@click.option("--wav/--no-wav", default=False, help="Export WAV (symbolic_v0 melody+bass).")
+@click.option("--wav/--no-wav", default=False, help="Export WAV (symbolic_v0 mix of parts).")
 @click.option("--csv-structure/--no-csv-structure", default=False, help="Export CSV of sections.")
 @click.option("--outdir", default="outputs", show_default=True, help="Directory for outputs.")
 @click.option("--outfile", default=None, help="Base filename (no extension). If omitted, a default is chosen.")
@@ -149,7 +150,7 @@ def main():
 def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
                  instruments, length, marker, stems, midi, wav, csv_structure, outdir, outfile,
                  waveform, sr, gain):
-    """Plan and export: symbolic_v0 (melody+bass) → optional groove → MIDI/WAV + CSV."""
+    """Plan and export: symbolic_v0 (melody+bass) → optional groove → MIDI/WAV + CSV + STEMS."""
 
     # Load config and merge with CLI (CLI wins)
     cfg = load_yaml_config(config)
@@ -222,8 +223,8 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         "structure": _propose_sections(total_sec),
         "notes": [
             "symbolic_v0: key/mode-aware melody+bass over your anchor (quarter-note melody, half-note bass).",
-            "Groove (if provided) imposes micro-timing on both parts.",
-            "Audio is a placeholder synth; stems/mixdown come next."
+            "Groove (if provided) imposes micro-timing on parts.",
+            "Audio uses a placeholder synth; stems and mixdown available."
         ]
     }
 
@@ -258,33 +259,50 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
                 writer.writerow([s["name"], _sec_to_mss(s["start"]), _sec_to_mss(s["end"]), s["start"], s["end"]])
         console.print(f"[green]Wrote[/green] CSV structure → {csv_path}")
 
-    # === Generate symbolic_v0 events ===
-    events: List[Tuple[int|str, float, float, int]] = []
-    if anchor_chords:
-        parts = generate_melody_bass(anchor_chords, key=key, mode=mode)
-        events = parts["melody"] + parts["bass"]
-    else:
+    # === Generate symbolic_v0 parts ===
+    if not anchor_chords:
         console.print("[yellow]No --anchor provided; nothing to render/export.[/yellow]")
+        return
 
-    # Apply groove
-    if events and groove_path:
+    parts = generate_melody_bass(anchor_chords, key=key, mode=mode)  # {"melody":[...], "bass":[...]}
+
+    # Apply groove per-part (so stems + mix share the same feel)
+    if groove_path:
         tpl = extract_groove_template(str(groove_path), quantize=quantize)
-        events = impose_groove_on_events(events, bpm=bpm, template=tpl, max_ms=humanize)
+        for name, evs in list(parts.items()):
+            parts[name] = impose_groove_on_events(evs, bpm=bpm, template=tpl, max_ms=humanize)
         console.print(f"[cyan]Applied groove from[/cyan] {groove_path} [cyan]({quantize}, ±{humanize}ms)[/cyan]")
 
+    # Flattened events for single-track MIDI/WAV (kept for convenience)
+    events = parts["melody"] + parts["bass"]
+
     # MIDI export (single-track for now)
-    if midi and events:
+    if midi:
         base = outfile or "demo"
         midi_path = outdir_path / f"{base}.mid"
         write_melody_midi(events, bpm=bpm, out_path=str(midi_path), instrument_name="melody_bass_v0", program=0)
-        console.print(f"[green]Wrote[/green] MIDI (melody+bass v0) → {midi_path}")
+        console.print(f("[green]Wrote[/green] MIDI (melody+bass v0) → {midi_path}"))
 
-    # WAV export
-    if wav and events:
+    # WAV export (mix of parts with the basic renderer)
+    if wav:
         base = outfile or "demo"
         wav_path = outdir_path / f"{base}.wav"
         write_wav_from_events(events, bpm=bpm, out_path=str(wav_path), sr=sr, wave=waveform, gain=gain)
-        console.print(f"[green]Wrote[/green] WAV ({waveform}, {sr} Hz) → {wav_path}")
+        console.print(f("[green]Wrote[/green] WAV ({waveform}, {sr} Hz) → {wav_path}"))
+
+    # STEMS export + stereo mixdown
+    if stems:
+        base = outfile or "demo"
+        render_opts = {
+            "sr": sr,
+            "defaults": {"wave": waveform, "gain": gain, "pan": 0.5},  # CLI waveform/gain apply unless per-part overrides
+            # per_part left to stems.py defaults (melody triangle @0.22/pan0.65; bass saw @0.28/pan0.35)
+        }
+        result = export_stems_and_mix(parts, bpm=bpm, outdir=outdir_path, base=base, render_opts=render_opts)
+        console.print(f"[green]Wrote[/green] stems & mix → {result['mix']}")
+        for k, v in result.items():
+            if k.startswith("stem_"):
+                console.print(f"  - {k.replace('stem_','')}: {v}")
 
     # Summary
     console.rule("[bold]Controls")
