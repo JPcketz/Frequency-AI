@@ -146,7 +146,7 @@ def main():
 @click.option("--csv-structure/--no-csv-structure", default=False, help="Export CSV of sections.")
 @click.option("--outdir", default="outputs", show_default=True, help="Directory for outputs.")
 @click.option("--outfile", default=None, help="Base filename (no extension). If omitted, a default is chosen.")
-@click.option("--waveform", type=click.ice.Choice(["sine","saw","square","triangle","noise"]), default="saw", show_default=True,
+@click.option("--waveform", type=click.Choice(["sine","saw","square","triangle","noise"]), default="saw", show_default=True,
               help="Waveform used for single-track WAV rendering.")
 @click.option("--sr", type=int, default=44100, show_default=True, help="Sample rate for WAV rendering.")
 @click.option("--gain", type=float, default=0.22, show_default=True, help="Output gain (0..1) for single-track WAV.")
