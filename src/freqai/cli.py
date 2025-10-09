@@ -14,7 +14,10 @@ from .inference.generate import anchor_to_demo_melody
 from .export.midi_export import write_melody_midi
 from .inference.groove_imposer import extract_groove_template, impose_groove_on_events
 
-# NEW: config support
+# WAV rendering
+from .synthesis.renderer import write_wav_from_events
+
+# Config support
 from .config import load_yaml_config, deep_merge
 
 console = Console()
@@ -145,15 +148,21 @@ def main():
 @click.option("--marker", multiple=True, help='Repeatable: "time:label" (e.g., 30:motif or 00:45:filter_sweep).')
 @click.option("--stems/--no-stems", default=False, help="Export per-instrument stems (when audio is implemented).")
 @click.option("--midi/--no-midi", default=False, help="Export MIDI (demo via anchor for now).")
-@click.option("--wav/--no-wav", default=False, help="Export final WAV (when audio is implemented).")
+@click.option("--wav/--no-wav", default=False, help="Export a demo WAV (anchor-based).")
 @click.option("--csv-structure/--no-csv-structure", default=False, help="Export CSV of sections.")
 @click.option("--outdir", default="outputs", show_default=True, help="Directory for outputs.")
 @click.option("--outfile", default=None, help="Base filename (no extension). If omitted, a default is chosen.")
+# NEW audio render opts
+@click.option("--waveform", type=click.Choice(["sine","saw","square","triangle","noise"]), default="saw", show_default=True,
+              help="Waveform used for demo audio rendering.")
+@click.option("--sr", type=int, default=44100, show_default=True, help="Sample rate for WAV rendering.")
+@click.option("--gain", type=float, default=0.22, show_default=True, help="Output gain (0..1) for demo audio.")
 def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
-                 instruments, length, marker, stems, midi, wav, csv_structure, outdir, outfile):
-    """Plan a generation and optionally export a demo MIDI and structure CSV (config-aware)."""
+                 instruments, length, marker, stems, midi, wav, csv_structure, outdir, outfile,
+                 waveform, sr, gain):
+    """Plan a generation and optionally export MIDI/CSV/WAV (config-aware)."""
 
-    # Load config (file path or FREQAI_CONFIG env) and merge with CLI (CLI wins)
+    # Load config and merge with CLI (CLI wins)
     cfg = load_yaml_config(config)
     cli_args: Dict[str, Any] = {
         "key": key, "mode": mode, "bpm": bpm,
@@ -162,8 +171,8 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         "length": length, "marker": list(marker) if marker else None,
         "stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure,
         "outdir": outdir, "outfile": outfile,
+        "waveform": waveform, "sr": sr, "gain": gain,
     }
-    # Drop Nones so config can supply defaults
     cli_args = {k: v for k, v in cli_args.items() if v is not None and v != ""}
     args = deep_merge(cfg, cli_args)
 
@@ -188,7 +197,6 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         raise click.BadParameter(f"quantize must be one of {sorted(QUANTIZE_ALLOWED)}")
 
     markers_arg = args.get("marker", [])
-    # allow markers list from YAML strings
     if isinstance(markers_arg, (list, tuple)):
         marker_tuple: Tuple[str, ...] = tuple(str(x) for x in markers_arg)
     elif isinstance(markers_arg, str) and markers_arg:
@@ -204,6 +212,10 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
     outdir = str(args.get("outdir", "outputs"))
     outfile = args.get("outfile", None)
 
+    waveform = str(args.get("waveform", "saw"))
+    sr = int(args.get("sr", 44100))
+    gain = float(args.get("gain", 0.22))
+
     plan = {
         "controls": {
             "key": key, "mode": mode, "bpm": bpm,
@@ -213,14 +225,15 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
             "instruments": instruments,
             "length_sec": total_sec,
             "markers": [{"time_sec": t, "label": lab} for t, lab in markers],
-            "exports": {"stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure}
+            "exports": {"stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure},
+            "render": {"waveform": waveform, "sr": sr, "gain": gain}
         },
         "structure": _propose_sections(total_sec),
         "notes": [
-            "This is a dry-run. Audio coming in later milestones.",
+            "This is a dry-run. Audio is a simple placeholder renderer for now.",
             "MIDI demo uses the anchor: one sustained root note per bar.",
-            "If --groove or groove: is provided, micro-timing is imposed from the reference loop.",
-            "Config precedence: CLI overrides config file; env FREQAI_CONFIG is used if --config is omitted."
+            "If groove is provided, micro-timing is imposed from the reference loop.",
+            "Config precedence: CLI overrides config file; env FREQAI_CONFIG used if --config is omitted."
         ]
     }
 
@@ -255,20 +268,34 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
                 writer.writerow([s["name"], _sec_to_mss(s["start"]), _sec_to_mss(s["end"]), s["start"], s["end"]])
         console.print(f"[green]Wrote[/green] CSV structure → {csv_path}")
 
-    # MIDI export (anchor → events → optional groove → MIDI)
+    # Build events from anchor
+    events = anchor_to_demo_melody(anchor_chords) if anchor_chords else []
+
+    # Apply groove if requested (affects both MIDI and WAV)
+    if events and groove_path:
+        tpl = extract_groove_template(str(groove_path), quantize=quantize)
+        events = impose_groove_on_events(events, bpm=bpm, template=tpl, max_ms=humanize)
+        console.print(f"[cyan]Applied groove from[/cyan] {groove_path} [cyan]({quantize}, ±{humanize}ms)[/cyan]")
+
+    # MIDI export
     if midi:
-        if not anchor_chords:
+        if not events:
             console.print("[yellow]--midi requested but no anchor provided; skipping MIDI demo.[/yellow]")
         else:
-            events = anchor_to_demo_melody(anchor_chords)
-            if groove_path:
-                tpl = extract_groove_template(str(groove_path), quantize=quantize)
-                events = impose_groove_on_events(events, bpm=bpm, template=tpl, max_ms=humanize)
-                console.print(f"[cyan]Applied groove from[/cyan] {groove_path} [cyan]({quantize}, ±{humanize}ms)[/cyan]")
             base = outfile or "demo_anchor"
             midi_path = outdir_path / f"{base}.mid"
             write_melody_midi(events, bpm=bpm, out_path=str(midi_path), instrument_name="anchor_demo", program=0)
             console.print(f"[green]Wrote[/green] demo MIDI from anchor → {midi_path}")
+
+    # WAV export
+    if wav:
+        if not events:
+            console.print("[yellow]--wav requested but no anchor provided; skipping audio demo.[/yellow]")
+        else:
+            base = outfile or "demo_anchor"
+            wav_path = outdir_path / f"{base}.wav"
+            write_wav_from_events(events, bpm=bpm, out_path=str(wav_path), sr=sr, wave=waveform, gain=gain)
+            console.print(f"[green]Wrote[/green] WAV ({waveform}, {sr} Hz) → {wav_path}")
 
     # Controls summary JSON
     console.rule("[bold]Controls")
