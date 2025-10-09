@@ -48,3 +48,49 @@ def write_melody_midi(
 
     pm.instruments.append(inst)
     pm.write(out_path)
+
+from typing import Dict, List, Tuple, Union
+import pretty_midi
+
+NoteEvent = Tuple[Union[int, str], float, float, int]
+
+def write_multitrack_midi(
+    parts: Dict[str, List[NoteEvent]],
+    bpm: int,
+    out_path: str,
+    programs: Dict[str, int] | None = None,
+    drum_flags: Dict[str, bool] | None = None,
+) -> str:
+    """
+    Write a single MIDI with one track per part.
+    parts: {"melody":[(pitch, start_beat, end_beat, vel), ...], "bass":[...]}
+    programs: optional GM program numbers per part (0..127). Default 0 (Acoustic Grand).
+    drum_flags: optional flags per part; if True, marks the track as drums (channel 10 semantics in DAWs).
+    """
+    pm = pretty_midi.PrettyMIDI()
+    spb = 60.0 / float(bpm)  # seconds per beat
+
+    programs = programs or {}
+    drum_flags = drum_flags or {}
+
+    for name, events in parts.items():
+        program = int(programs.get(name, 0))
+        is_drum = bool(drum_flags.get(name, False))
+        inst = pretty_midi.Instrument(program=program, is_drum=is_drum, name=name)
+
+        for pitch, s_beat, e_beat, vel in events:
+            # Convert pitch
+            if isinstance(pitch, str):
+                pnum = int(pretty_midi.note_name_to_number(pitch))
+            else:
+                pnum = int(pitch)
+            # Convert beat -> seconds
+            start = float(s_beat) * spb
+            end = max(float(e_beat) * spb, start + 1e-4)
+            v = max(1, min(int(vel), 127))
+            inst.notes.append(pretty_midi.Note(velocity=v, pitch=pnum, start=start, end=end))
+
+        pm.instruments.append(inst)
+
+    pm.write(out_path)
+    return out_path
