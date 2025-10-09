@@ -12,7 +12,7 @@ from rich.table import Table
 # Symbolic generation (v0), groove, exports
 from .inference.symbolic_v0 import generate_melody_bass
 from .inference.groove_imposer import extract_groove_template, impose_groove_on_events
-from .export.midi_export import write_melody_midi
+from .export.midi_export import write_melody_midi, write_multitrack_midi
 from .synthesis.renderer import write_wav_from_events
 from .export.stems import export_stems_and_mix  # <— NEW
 
@@ -281,14 +281,14 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         base = outfile or "demo"
         midi_path = outdir_path / f"{base}.mid"
         write_melody_midi(events, bpm=bpm, out_path=str(midi_path), instrument_name="melody_bass_v0", program=0)
-        console.print(f"[green]Wrote[/green] MIDI (melody+bass v0) → {midi_path}")
+        console.print(f"[green]Wrote[/green] MIDI (single-track) → {midi_path}")
 
-    # WAV export (mix of parts with the basic renderer)
-    if wav:
-        base = outfile or "demo"
-        wav_path = outdir_path / f"{base}.wav"
-        write_wav_from_events(events, bpm=bpm, out_path=str(wav_path), sr=sr, wave=waveform, gain=gain)
-        console.print(f"[green]Wrote[/green] WAV ({waveform}, {sr} Hz) → {wav_path}")
+        # NEW: multitrack MIDI (one track per part)
+        parts_mid_path = outdir_path / f"{base}.parts.mid"
+        # General MIDI programs: 73=Flute (melody), 34=Electric Bass (finger)
+        write_multitrack_midi(parts, bpm=bpm, out_path=str(parts_mid_path),
+                              programs={"melody": 73, "bass": 34})
+        console.print(f"[green]Wrote[/green] MIDI (multitrack: melody/bass) → {parts_mid_path}")
 
     # STEMS export + stereo mixdown
     if stems:
