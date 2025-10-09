@@ -87,7 +87,7 @@ def _parse_markers(markers: Tuple[str, ...]) -> List[Tuple[int, str]]:
     for m in markers:
         if ":" not in m:
             raise click.BadParameter(f"Marker '{m}' must be 'time:label' (e.g., 30:motif or 00:45:motif)")
-        time_str, label = m.split(":", 1)
+        time_str, label = m.rsplit(":", 1)
         time_str, label = time_str.strip().lower(), label.strip()
         if time_str.endswith("s") or re.fullmatch(r"\d+:\d{2}", time_str) or time_str.isdigit():
             t = _parse_duration(time_str)
@@ -281,14 +281,14 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         base = outfile or "demo"
         midi_path = outdir_path / f"{base}.mid"
         write_melody_midi(events, bpm=bpm, out_path=str(midi_path), instrument_name="melody_bass_v0", program=0)
-        console.print(f("[green]Wrote[/green] MIDI (melody+bass v0) → {midi_path}"))
+        console.print(f"[green]Wrote[/green] MIDI (melody+bass v0) → {midi_path}")
 
     # WAV export (mix of parts with the basic renderer)
     if wav:
         base = outfile or "demo"
         wav_path = outdir_path / f"{base}.wav"
         write_wav_from_events(events, bpm=bpm, out_path=str(wav_path), sr=sr, wave=waveform, gain=gain)
-        console.print(f("[green]Wrote[/green] WAV ({waveform}, {sr} Hz) → {wav_path}"))
+        console.print(f"[green]Wrote[/green] WAV ({waveform}, {sr} Hz) → {wav_path}")
 
     # STEMS export + stereo mixdown
     if stems:
