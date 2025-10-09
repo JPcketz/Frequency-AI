@@ -2,19 +2,17 @@ import re
 import json
 import csv
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Mapping, Any
+from typing import List, Tuple, Optional, Dict, Any
 
 import click
 from rich import print
 from rich.console import Console
 from rich.table import Table
 
-# MIDI + groove
-from .inference.generate import anchor_to_demo_melody
-from .export.midi_export import write_melody_midi
+# Symbolic generation (v0), groove, exports
+from .inference.symbolic_v0 import generate_melody_bass
 from .inference.groove_imposer import extract_groove_template, impose_groove_on_events
-
-# WAV rendering
+from .export.midi_export import write_melody_midi
 from .synthesis.renderer import write_wav_from_events
 
 # Config support
@@ -35,9 +33,7 @@ MODE_ALIASES = {
     "aeolian": "aeolian", "minor": "aeolian",
     "locrian": "locrian",
 }
-
 QUANTIZE_ALLOWED = {"1/4","1/8","1/12","1/16","1/24","1/32"}
-
 
 def _canon_key(k: str) -> str:
     k = k.strip().replace("♯","#").replace("♭","b")
@@ -69,8 +65,7 @@ def _parse_anchor(s: Optional[str]) -> List[str]:
     if not s:
         return []
     parts = re.split(r"[,\-\s]+", s.strip())
-    parts = [p for p in parts if p]
-    return parts
+    return [p for p in parts if p]
 
 def _parse_duration(s: str) -> int:
     s = s.strip().lower()
@@ -80,24 +75,20 @@ def _parse_duration(s: str) -> int:
         return int(s[:-1])
     m = re.fullmatch(r"(\d+)m(?:(\d+)s)?", s)
     if m:
-        mins = int(m.group(1)); secs = int(m.group(2) or 0)
-        return mins*60 + secs
+        return int(m.group(1))*60 + int(m.group(2) or 0)
     m = re.fullmatch(r"(\d+):([0-5]\d)", s)
     if m:
         return int(m.group(1))*60 + int(m.group(2))
     raise click.BadParameter("Length must look like 60, 60s, 1m30s, 1:00, or 00:45")
 
-def _parse_markers(markers: Tuple[str]) -> List[Tuple[int, str]]:
+def _parse_markers(markers: Tuple[str, ...]) -> List[Tuple[int, str]]:
     out = []
     for m in markers:
         if ":" not in m:
             raise click.BadParameter(f"Marker '{m}' must be 'time:label' (e.g., 30:motif or 00:45:motif)")
         time_str, label = m.split(":", 1)
-        time_str = time_str.strip().lower()
-        label = label.strip()
-        if time_str.endswith("s"):
-            t = _parse_duration(time_str)
-        elif re.fullmatch(r"\d+:\d{2}", time_str) or time_str.isdigit():
+        time_str, label = time_str.strip().lower(), label.strip()
+        if time_str.endswith("s") or re.fullmatch(r"\d+:\d{2}", time_str) or time_str.isdigit():
             t = _parse_duration(time_str)
         else:
             raise click.BadParameter(f"Bad time format in marker '{m}'")
@@ -108,7 +99,7 @@ def _parse_markers(markers: Tuple[str]) -> List[Tuple[int, str]]:
 def _sec_to_mss(t: int) -> str:
     return f"{t//60:02d}:{t%60:02d}"
 
-def _propose_sections(total_sec: int) -> List[Dict]:
+def _propose_sections(total_sec: int) -> List[Dict[str, int]]:
     if total_sec < 20:
         return [{"name":"A","start":0,"end":total_sec}]
     cuts = [0,
@@ -121,14 +112,13 @@ def _propose_sections(total_sec: int) -> List[Dict]:
     sections = []
     for i in range(len(names)):
         s, e = cuts[i], cuts[i+1]
-        if e - s <= 0:
-            continue
-        sections.append({"name": names[i], "start": s, "end": e})
+        if e - s > 0:
+            sections.append({"name": names[i], "start": s, "end": e})
     return sections
 
 @click.group()
 def main():
-    """Frequency AI — CLI (M0 dry-run planner)."""
+    """Frequency AI — CLI (M0: symbolic v0 + groove + MIDI/WAV)."""
     pass
 
 @main.command("generate")
@@ -143,16 +133,15 @@ def main():
               help="Path to a reference MIDI loop for groove extraction.")
 @click.option("--quantize", default="1/16", show_default=True, help="Groove grid (e.g., 1/8, 1/16).")
 @click.option("--humanize", type=float, default=12.0, show_default=True, help="Max micro-timing shift (ms).")
-@click.option("--instruments", default="", help='Comma-separated ≤4 instruments, e.g. "analog_bass,e_gtr_bigverb,jazz_kit,cin_pad"')
+@click.option("--instruments", default="", help='Comma-separated ≤4 instruments (labels only for now).')
 @click.option("--length", required=False, help='Total length (e.g., 60s, 1:00, 1m30s).')
 @click.option("--marker", multiple=True, help='Repeatable: "time:label" (e.g., 30:motif or 00:45:filter_sweep).')
-@click.option("--stems/--no-stems", default=False, help="Export per-instrument stems (when audio is implemented).")
-@click.option("--midi/--no-midi", default=False, help="Export MIDI (demo via anchor for now).")
-@click.option("--wav/--no-wav", default=False, help="Export a demo WAV (anchor-based).")
+@click.option("--stems/--no-stems", default=False, help="(Future) Export per-instrument stems.")
+@click.option("--midi/--no-midi", default=False, help="Export MIDI (symbolic_v0 melody+bass).")
+@click.option("--wav/--no-wav", default=False, help="Export WAV (symbolic_v0 melody+bass).")
 @click.option("--csv-structure/--no-csv-structure", default=False, help="Export CSV of sections.")
 @click.option("--outdir", default="outputs", show_default=True, help="Directory for outputs.")
 @click.option("--outfile", default=None, help="Base filename (no extension). If omitted, a default is chosen.")
-# NEW audio render opts
 @click.option("--waveform", type=click.Choice(["sine","saw","square","triangle","noise"]), default="saw", show_default=True,
               help="Waveform used for demo audio rendering.")
 @click.option("--sr", type=int, default=44100, show_default=True, help="Sample rate for WAV rendering.")
@@ -160,7 +149,7 @@ def main():
 def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
                  instruments, length, marker, stems, midi, wav, csv_structure, outdir, outfile,
                  waveform, sr, gain):
-    """Plan a generation and optionally export MIDI/CSV/WAV (config-aware)."""
+    """Plan and export: symbolic_v0 (melody+bass) → optional groove → MIDI/WAV + CSV."""
 
     # Load config and merge with CLI (CLI wins)
     cfg = load_yaml_config(config)
@@ -176,19 +165,19 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
     cli_args = {k: v for k, v in cli_args.items() if v is not None and v != ""}
     args = deep_merge(cfg, cli_args)
 
-    # --- Parse/validate merged args ---
-    if "key" not in args or "mode" not in args or "bpm" not in args or "length" not in args:
-        raise click.UsageError("Please specify --key, --mode, --bpm, and --length (either via CLI or --config).")
+    # Required
+    for req in ("key","mode","bpm","length"):
+        if req not in args:
+            raise click.UsageError("Please specify --key, --mode, --bpm, and --length (CLI or --config).")
 
     key = _canon_key(str(args["key"]))
     mode = _canon_mode(str(args["mode"]))
     bpm = int(args["bpm"])
-    length = str(args["length"])
-    total_sec = _parse_duration(length)
+    total_sec = _parse_duration(str(args["length"]))
 
-    instruments = _parse_instruments(str(args.get("instruments", "")))
     anchor_chords = _parse_anchor(str(args.get("anchor", "")))
     anchor_bars = int(args.get("anchor_bars", 4))
+    instruments = _parse_instruments(str(args.get("instruments", "")))
 
     groove_path = args.get("groove", None)
     quantize = str(args.get("quantize", "1/16"))
@@ -196,6 +185,7 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
     if quantize not in QUANTIZE_ALLOWED:
         raise click.BadParameter(f"quantize must be one of {sorted(QUANTIZE_ALLOWED)}")
 
+    # Markers
     markers_arg = args.get("marker", [])
     if isinstance(markers_arg, (list, tuple)):
         marker_tuple: Tuple[str, ...] = tuple(str(x) for x in markers_arg)
@@ -205,17 +195,18 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         marker_tuple = tuple()
     markers = _parse_markers(marker_tuple) if marker_tuple else []
 
+    # Booleans & output
     stems = bool(args.get("stems", False))
     midi = bool(args.get("midi", False))
     wav = bool(args.get("wav", False))
     csv_structure = bool(args.get("csv_structure", False))
     outdir = str(args.get("outdir", "outputs"))
     outfile = args.get("outfile", None)
-
     waveform = str(args.get("waveform", "saw"))
     sr = int(args.get("sr", 44100))
     gain = float(args.get("gain", 0.22))
 
+    # Plan
     plan = {
         "controls": {
             "key": key, "mode": mode, "bpm": bpm,
@@ -230,14 +221,13 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         },
         "structure": _propose_sections(total_sec),
         "notes": [
-            "This is a dry-run. Audio is a simple placeholder renderer for now.",
-            "MIDI demo uses the anchor: one sustained root note per bar.",
-            "If groove is provided, micro-timing is imposed from the reference loop.",
-            "Config precedence: CLI overrides config file; env FREQAI_CONFIG used if --config is omitted."
+            "symbolic_v0: key/mode-aware melody+bass over your anchor (quarter-note melody, half-note bass).",
+            "Groove (if provided) imposes micro-timing on both parts.",
+            "Audio is a placeholder synth; stems/mixdown come next."
         ]
     }
 
-    # Pretty table: sections
+    # Pretty tables
     table = Table(title="Planned Sections", show_lines=False)
     table.add_column("Section", no_wrap=True)
     table.add_column("Start", justify="right")
@@ -246,7 +236,6 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         table.add_row(s["name"], _sec_to_mss(s["start"]), _sec_to_mss(s["end"]))
     console.print(table)
 
-    # Pretty table: markers
     if markers:
         mtab = Table(title="Markers", show_lines=False)
         mtab.add_column("Time"); mtab.add_column("Label")
@@ -254,10 +243,11 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
             mtab.add_row(_sec_to_mss(t), lab)
         console.print(mtab)
 
-    # Ensure output dir
-    outdir_path = Path(outdir); outdir_path.mkdir(parents=True, exist_ok=True)
+    # Ensure out dir
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
 
-    # CSV export
+    # CSV structure
     if csv_structure:
         base = outfile or "structure"
         csv_path = outdir_path / f"{base}.csv"
@@ -268,36 +258,35 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
                 writer.writerow([s["name"], _sec_to_mss(s["start"]), _sec_to_mss(s["end"]), s["start"], s["end"]])
         console.print(f"[green]Wrote[/green] CSV structure → {csv_path}")
 
-    # Build events from anchor
-    events = anchor_to_demo_melody(anchor_chords) if anchor_chords else []
+    # === Generate symbolic_v0 events ===
+    events: List[Tuple[int|str, float, float, int]] = []
+    if anchor_chords:
+        parts = generate_melody_bass(anchor_chords, key=key, mode=mode)
+        events = parts["melody"] + parts["bass"]
+    else:
+        console.print("[yellow]No --anchor provided; nothing to render/export.[/yellow]")
 
-    # Apply groove if requested (affects both MIDI and WAV)
+    # Apply groove
     if events and groove_path:
         tpl = extract_groove_template(str(groove_path), quantize=quantize)
         events = impose_groove_on_events(events, bpm=bpm, template=tpl, max_ms=humanize)
         console.print(f"[cyan]Applied groove from[/cyan] {groove_path} [cyan]({quantize}, ±{humanize}ms)[/cyan]")
 
-    # MIDI export
-    if midi:
-        if not events:
-            console.print("[yellow]--midi requested but no anchor provided; skipping MIDI demo.[/yellow]")
-        else:
-            base = outfile or "demo_anchor"
-            midi_path = outdir_path / f"{base}.mid"
-            write_melody_midi(events, bpm=bpm, out_path=str(midi_path), instrument_name="anchor_demo", program=0)
-            console.print(f"[green]Wrote[/green] demo MIDI from anchor → {midi_path}")
+    # MIDI export (single-track for now)
+    if midi and events:
+        base = outfile or "demo"
+        midi_path = outdir_path / f"{base}.mid"
+        write_melody_midi(events, bpm=bpm, out_path=str(midi_path), instrument_name="melody_bass_v0", program=0)
+        console.print(f"[green]Wrote[/green] MIDI (melody+bass v0) → {midi_path}")
 
     # WAV export
-    if wav:
-        if not events:
-            console.print("[yellow]--wav requested but no anchor provided; skipping audio demo.[/yellow]")
-        else:
-            base = outfile or "demo_anchor"
-            wav_path = outdir_path / f"{base}.wav"
-            write_wav_from_events(events, bpm=bpm, out_path=str(wav_path), sr=sr, wave=waveform, gain=gain)
-            console.print(f"[green]Wrote[/green] WAV ({waveform}, {sr} Hz) → {wav_path}")
+    if wav and events:
+        base = outfile or "demo"
+        wav_path = outdir_path / f"{base}.wav"
+        write_wav_from_events(events, bpm=bpm, out_path=str(wav_path), sr=sr, wave=waveform, gain=gain)
+        console.print(f"[green]Wrote[/green] WAV ({waveform}, {sr} Hz) → {wav_path}")
 
-    # Controls summary JSON
+    # Summary
     console.rule("[bold]Controls")
     print(json.dumps(plan["controls"], indent=2))
     console.rule("[bold]Next steps")
