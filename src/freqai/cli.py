@@ -10,7 +10,8 @@ from rich.console import Console
 from rich.table import Table
 
 # Generators
-from .inference.song_v0 import generate_song_v0           # <— NEW: full-song generator
+from .inference.song_v0 import generate_song_v0
+from .inference.motif_v0 import apply_motif_repetitionfull-song generator
 from .inference.groove_imposer import extract_groove_template, impose_groove_on_events
 from .export.midi_export import write_melody_midi, write_multitrack_midi
 from .synthesis.renderer import write_wav_from_events
@@ -140,6 +141,8 @@ def main():
 @click.option("--marker", multiple=True, help='Repeatable: "time:label" (e.g., 30:motif or 00:45:filter_sweep).')
 @click.option("--drums/--no-drums", default=True, show_default=True,
               help="Include a simple drum kit part (kick/snare/hat).")
+@click.option("--motif/--no-motif", default=True, show_default=True, help="Repeat a short melody motif in Chorus sections.")
+@click.option("--motif-bars", type=int, default=2, show_default=True, help="Motif length in bars for repetition.")
 @click.option("--stems/--no-stems", default=False, help="Export per-part stems and a stereo mix.")
 @click.option("--midi/--no-midi", default=False, help="Export MIDI (single-track + multitrack).")
 @click.option("--wav/--no-wav", default=False, help="Export WAV (single-track quick render).")
@@ -150,9 +153,7 @@ def main():
               help="Waveform used for single-track WAV rendering.")
 @click.option("--sr", type=int, default=44100, show_default=True, help="Sample rate for WAV rendering.")
 @click.option("--gain", type=float, default=0.22, show_default=True, help="Output gain (0..1) for single-track WAV.")
-def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
-                 instruments, length, marker, drums, stems, midi, wav, csv_structure, outdir, outfile,
-                 waveform, sr, gain):
+def cmd_generate(..., marker, drums, stems, midi, wav, csv_structure, outdir, outfile, waveform, sr, gain, motif, motif_bars):
     """Plan and export: full-song (tiled from anchor) + optional drums → groove → MIDI/WAV/CSV/STEMS."""
 
     # Load config and merge with CLI (CLI wins)
@@ -164,7 +165,7 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
         "length": length, "marker": list(marker) if marker else None,
         "drums": drums, "stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure,
         "outdir": outdir, "outfile": outfile,
-        "waveform": waveform, "sr": sr, "gain": gain,
+        "waveform": waveform, "sr": sr, "gain": gain, "motif": motif, "motif_bars": motif_bars,
     }
     cli_args = {k: v for k, v in cli_args.items() if v is not None and v != ""}
     args = deep_merge(cfg, cli_args)
@@ -271,6 +272,15 @@ def cmd_generate(config, key, mode, bpm, anchor, anchor_bars, groove, quantize, 
     parts = generate_song_v0(  # tiles anchor to song length under the hood
         anchor_chords, key=key, mode=mode, length_sec=total_sec, bpm=bpm, include_drums=drums
     )
+
+    if bool(args.get("motif", True)):
+    parts = apply_motif_repetition(
+        parts, bpm=bpm, sections=plan["structure"],
+        target_names=("Chorus", "Chorus/Outro"),
+        motif_bars=int(args.get("motif_bars", 2)),
+        beats_per_bar=4,
+    )
+    console.print("[cyan]Applied motif repetition[/cyan] across Chorus sections.")
 
     # Apply groove per-part (if any)
     if groove_path:
