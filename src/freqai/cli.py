@@ -3,16 +3,19 @@ import json
 import csv
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
-
+from math import ceil
+from .inference.voiceleading_v0 import improve_voice_leading
 import click
-from rich import print
 from rich.console import Console
 from rich.table import Table
 
-# Generators
+# Generators & processors
 from .inference.song_v0 import generate_song_v0
-from .inference.motif_v0 import apply_motif_repetitionfull-song generator
+from .inference.motif_v0 import apply_motif_repetition
+from .inference.arrange_v0 import apply_arrangement
 from .inference.groove_imposer import extract_groove_template, impose_groove_on_events
+
+# Exports / rendering
 from .export.midi_export import write_melody_midi, write_multitrack_midi
 from .synthesis.renderer import write_wav_from_events
 from .export.stems import export_stems_and_mix
@@ -88,7 +91,7 @@ def _parse_markers(markers: Tuple[str, ...]) -> List[Tuple[int, str]]:
     for m in markers:
         if ":" not in m:
             raise click.BadParameter(f"Marker '{m}' must be 'time:label' (e.g., 30:motif or 00:45:motif)")
-        # use last colon so 00:30 works
+        # use the LAST colon so 00:30 works
         time_str, label = m.rsplit(":", 1)
         time_str, label = time_str.strip().lower(), label.strip()
         if time_str.endswith("s") or re.fullmatch(r"\d+:\d{2}", time_str) or time_str.isdigit():
@@ -121,7 +124,7 @@ def _propose_sections(total_sec: int) -> List[Dict[str, int]]:
 
 @click.group()
 def main():
-    """Frequency AI — CLI (song_v0 + drums + groove + MIDI/WAV/STEMS)."""
+    """Frequency AI — CLI (full-song + motif + arrangement + groove + MIDI/WAV/STEMS)."""
     pass
 
 @main.command("generate")
@@ -139,10 +142,12 @@ def main():
 @click.option("--instruments", default="", help='Comma-separated ≤4 instruments (labels only for now).')
 @click.option("--length", required=False, help='Total length (e.g., 60s, 1:00, 1m30s).')
 @click.option("--marker", multiple=True, help='Repeatable: "time:label" (e.g., 30:motif or 00:45:filter_sweep).')
-@click.option("--drums/--no-drums", default=True, show_default=True,
-              help="Include a simple drum kit part (kick/snare/hat).")
 @click.option("--motif/--no-motif", default=True, show_default=True, help="Repeat a short melody motif in Chorus sections.")
 @click.option("--motif-bars", type=int, default=2, show_default=True, help="Motif length in bars for repetition.")
+@click.option("--arrange/--no-arrange", default=True, show_default=True,
+              help="Add drum fills at section changes and simple section dynamics.")
+@click.option("--drums/--no-drums", default=True, show_default=True,
+              help="Include a simple drum kit part (kick/snare/hat) via song_v0.")
 @click.option("--stems/--no-stems", default=False, help="Export per-part stems and a stereo mix.")
 @click.option("--midi/--no-midi", default=False, help="Export MIDI (single-track + multitrack).")
 @click.option("--wav/--no-wav", default=False, help="Export WAV (single-track quick render).")
@@ -151,10 +156,18 @@ def main():
 @click.option("--outfile", default=None, help="Base filename (no extension). If omitted, a default is chosen.")
 @click.option("--waveform", type=click.Choice(["sine","saw","square","triangle","noise"]), default="saw", show_default=True,
               help="Waveform used for single-track WAV rendering.")
+@click.option("--voicelead/--no-voicelead", default=True, show_default=True,
+              help="Smooth bass motion; favor chord tones on strong beats.")
+@click.option("--voicelead-melody/--no-voicelead-melody", default=False, show_default=True,
+              help="Also nudge melody to chord tones on strong beats (subtle).")
 @click.option("--sr", type=int, default=44100, show_default=True, help="Sample rate for WAV rendering.")
 @click.option("--gain", type=float, default=0.22, show_default=True, help="Output gain (0..1) for single-track WAV.")
-def cmd_generate(..., marker, drums, stems, midi, wav, csv_structure, outdir, outfile, waveform, sr, gain, motif, motif_bars):
-    """Plan and export: full-song (tiled from anchor) + optional drums → groove → MIDI/WAV/CSV/STEMS."""
+def cmd_generate(
+    config, key, mode, bpm, anchor, anchor_bars, groove, quantize, humanize,
+    instruments, length, marker, motif, motif_bars, arrange, drums, stems, midi, wav,
+    csv_structure, outdir, outfile, waveform, sr, gain, voicelead, voicelead_melody
+):
+  """Plan and export: full-song (tiled from anchor) + motif + arrangement + optional groove → MIDI/WAV/CSV/STEMS."""
 
     # Load config and merge with CLI (CLI wins)
     cfg = load_yaml_config(config)
@@ -163,9 +176,10 @@ def cmd_generate(..., marker, drums, stems, midi, wav, csv_structure, outdir, ou
         "anchor": anchor, "anchor_bars": anchor_bars, "groove": str(groove) if groove else None,
         "quantize": quantize, "humanize": humanize, "instruments": instruments,
         "length": length, "marker": list(marker) if marker else None,
+        "motif": motif, "motif_bars": motif_bars, "arrange": arrange,
         "drums": drums, "stems": stems, "midi": midi, "wav": wav, "csv_structure": csv_structure,
         "outdir": outdir, "outfile": outfile,
-        "waveform": waveform, "sr": sr, "gain": gain, "motif": motif, "motif_bars": motif_bars,
+        "waveform": waveform, "sr": sr, "gain": gain, "voicelead": voicelead, "voicelead_melody": voicelead_melody,
     }
     cli_args = {k: v for k, v in cli_args.items() if v is not None and v != ""}
     args = deep_merge(cfg, cli_args)
@@ -201,6 +215,9 @@ def cmd_generate(..., marker, drums, stems, midi, wav, csv_structure, outdir, ou
     markers = _parse_markers(marker_tuple) if marker_tuple else []
 
     # Booleans & output
+    motif = bool(args.get("motif", True))
+    motif_bars = int(args.get("motif_bars", 2))
+    arrange = bool(args.get("arrange", True))
     drums = bool(args.get("drums", True))
     stems = bool(args.get("stems", False))
     midi = bool(args.get("midi", False))
@@ -211,13 +228,16 @@ def cmd_generate(..., marker, drums, stems, midi, wav, csv_structure, outdir, ou
     waveform = str(args.get("waveform", "saw"))
     sr = int(args.get("sr", 44100))
     gain = float(args.get("gain", 0.22))
+    voicelead = bool(args.get("voicelead", True))
+    voicelead_melody = bool(args.get("voicelead_melody", False))
 
-    # Plan table
+    # Plan (for display + optional CSV)
     plan = {
         "controls": {
             "key": key, "mode": mode, "bpm": bpm,
             "anchor": anchor_chords, "anchor_bars": anchor_bars,
-            "drums": drums,
+            "motif": motif, "motif_bars": motif_bars,
+            "arrange": arrange, "drums": drums,
             "groove_midi": groove_path,
             "quantize": quantize, "humanize_ms": humanize,
             "instruments": instruments,
@@ -228,12 +248,15 @@ def cmd_generate(..., marker, drums, stems, midi, wav, csv_structure, outdir, ou
         },
         "structure": _propose_sections(total_sec),
         "notes": [
-            "song_v0 tiles your anchor to the requested length, then generates melody+bass (+drums).",
-            "Groove (if provided) imposes micro-timing on all parts.",
+            "song_v0 tiles your anchor to the requested length, then generates melody+bass (+drums if enabled).",
+            "motif_v0 repeats a short hook in the Chorus sections for catchiness.",
+            "arrange_v0 adds drum fills at section changes and simple section dynamics.",
+            "Groove (if provided) humanizes timing after motif/arrangement.",
             "For best audio, use --stems (different waves per part + panning)."
         ]
     }
 
+    # Pretty tables
     table = Table(title="Planned Sections", show_lines=False)
     table.add_column("Section", no_wrap=True)
     table.add_column("Start", justify="right")
@@ -269,20 +292,45 @@ def cmd_generate(..., marker, drums, stems, midi, wav, csv_structure, outdir, ou
         console.print("[yellow]No --anchor provided; nothing to render/export.[/yellow]")
         return
 
-    parts = generate_song_v0(  # tiles anchor to song length under the hood
+    parts = generate_song_v0(  # tiles anchor to requested length
         anchor_chords, key=key, mode=mode, length_sec=total_sec, bpm=bpm, include_drums=drums
     )
-
-    if bool(args.get("motif", True)):
-    parts = apply_motif_repetition(
-        parts, bpm=bpm, sections=plan["structure"],
-        target_names=("Chorus", "Chorus/Outro"),
-        motif_bars=int(args.get("motif_bars", 2)),
-        beats_per_bar=4,
+    
+    # Voice-leading: smooth bass motion & strong-beat chord tones (before motif/arrangement)
+     if voicelead and anchor_chords:
+          # Rebuild the full tiled anchor used by song_v0 so bar->chord lines up
+          beats_per_bar = 4
+          spb = 60.0 / float(bpm)
+          bars_total = int(ceil(float(total_sec) / (spb * beats_per_bar)))
+          tiled_anchor = [anchor_chords[i % len(anchor_chords)] for i in         range(bars_total)]
+          parts = improve_voice_leading(
+          parts=parts,
+          anchor=tiled_anchor,
+          key=key,
+          mode=mode,
+          beats_per_bar=beats_per_bar,
+          adjust_melody_on_strong_beats=voicelead_melody,
     )
-    console.print("[cyan]Applied motif repetition[/cyan] across Chorus sections.")
+    console.print(f"[cyan]Applied voice-leading[/cyan] (bass{' + melody' if voicelead_melody else ''}).")
 
-    # Apply groove per-part (if any)
+    # Motif repetition across Chorus sections (do this BEFORE groove)
+    if motif:
+        parts = apply_motif_repetition(
+            parts=parts,
+            bpm=bpm,
+            sections=plan["structure"],
+            target_names=("Chorus", "Chorus/Outro"),
+            motif_bars=motif_bars,
+            beats_per_bar=4,
+        )
+        console.print("[cyan]Applied motif repetition[/cyan] across Chorus sections.")
+
+    # Arrangement polish (fills + section dynamics), also BEFORE groove
+    if arrange:
+        parts = apply_arrangement(parts, bpm=bpm, sections=plan["structure"])
+        console.print("[cyan]Applied arrangement[/cyan] (fills + section dynamics).")
+
+    # Apply groove per-part (AFTER motif/arrangement so timing is humanized)
     if groove_path:
         tpl = extract_groove_template(str(groove_path), quantize=quantize)
         for name, evs in list(parts.items()):
