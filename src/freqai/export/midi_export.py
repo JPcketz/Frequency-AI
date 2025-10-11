@@ -1,96 +1,145 @@
+# -*- coding: utf-8 -*-
 """
-Minimal MIDI export helper for Frequency AI (M0).
-Converts note events (pitch, start_beat, end_beat, velocity) to a MIDI file.
+MIDI export utilities for Frequency AI.
 
-pitch: int MIDI note number (e.g., 60 for C4) OR note name string ("C4", "G#3")
-start_beat/end_beat: beats from start (float allowed)
-velocity: 1..127
+- write_melody_midi(events, bpm, out_path, instrument_name="melody", program=0)
+- write_multitrack_midi(parts, bpm, out_path, programs=None, drum_flags=None)
+
+Notes:
+- All times are expressed in BEATS in the input events and converted to seconds via 60/bpm.
+- NoteEvent = (pitch: int|str, start_beat: float, end_beat: float, velocity: int)
+- For drums, pass drum_flags={"drums": True} (GM mapping expected, e.g., 36 kick, 38 snare, 42 hat).
 """
-from typing import Iterable, Tuple, Union
+
+from typing import Dict, List, Tuple, Union, Optional
+import os
+import time
+
 import pretty_midi
 
 NoteEvent = Tuple[Union[int, str], float, float, int]
 
+
+# ---------------------------------------------------------------------------
+# Safer write on Windows: write tmp, then atomic-ish replace, with retries
+# ---------------------------------------------------------------------------
+def _safe_pm_write(pm: pretty_midi.PrettyMIDI, out_path: str,
+                   retries: int = 3, delay: float = 0.5) -> str:
+    """
+    Write PrettyMIDI `pm` to `out_path` more safely on Windows:
+      1) write to out_path + ".tmp"
+      2) attempt to remove existing out_path (ignore failures)
+      3) os.replace(tmp, out_path)
+      4) retry on PermissionError
+      5) fallback to timestamped filename if all retries fail
+
+    Returns the path actually written.
+    """
+    tmp = out_path + ".tmp"
+    for _ in range(retries):
+        try:
+            pm.write(tmp)
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    # If removal fails (locked), still try replace below.
+                    pass
+            os.replace(tmp, out_path)
+            return out_path
+        except PermissionError:
+            time.sleep(delay)
+        except Exception:
+            # Best effort cleanup of tmp on unexpected errors
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    base, ext = os.path.splitext(out_path)
+    alt = f"{base}.{int(time.time())}{ext}"
+    pm.write(alt)
+    return alt
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _beats_to_seconds(b: float, bpm: int) -> float:
+    return float(b) * (60.0 / float(bpm))
+
+
+def _add_note(instr: pretty_midi.Instrument, pitch: int, s_beats: float, e_beats: float,
+              velocity: int, bpm: int) -> None:
+    start = _beats_to_seconds(s_beats, bpm)
+    end = _beats_to_seconds(e_beats, bpm)
+    if end <= start:
+        end = start + 1e-4
+    velocity = max(1, min(int(velocity), 127))
+    note = pretty_midi.Note(velocity=velocity, pitch=int(pitch), start=start, end=end)
+    instr.notes.append(note)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def write_melody_midi(
-    note_events: Iterable[NoteEvent],
+    events: List[NoteEvent],
     bpm: int,
     out_path: str,
     instrument_name: str = "melody",
     program: int = 0,
-) -> None:
+) -> str:
     """
-    Write a single-track melody MIDI using the given BPM.
-
-    Example:
-        events = [
-            ("A3", 0.0, 1.0, 96),
-            ("G3", 1.0, 2.0, 96),
-            ("C4", 2.0, 3.0, 100),
-            ("F3", 3.0, 4.0, 100),
-        ]
-        write_melody_midi(events, bpm=112, out_path="demo.mid")
+    Write a single-track MIDI from a flat list of events.
+    Non-int pitches are skipped.
     """
-    pm = pretty_midi.PrettyMIDI(initial_tempo=float(bpm))
-    inst = pretty_midi.Instrument(program=program, name=instrument_name)
+    pm = pretty_midi.PrettyMIDI()
+    instr = pretty_midi.Instrument(program=int(program), name=instrument_name, is_drum=False)
+    for p, s, e, v in events:
+        if isinstance(p, int):
+            _add_note(instr, p, s, e, v, bpm)
+    pm.instruments.append(instr)
+    written = _safe_pm_write(pm, out_path)
+    return written
 
-    sec_per_beat = 60.0 / float(bpm)
-
-    for pitch, s_beat, e_beat, vel in note_events:
-        if isinstance(pitch, str):
-            pitch_num = pretty_midi.note_name_to_number(pitch)
-        else:
-            pitch_num = int(pitch)
-        start_sec = float(s_beat) * sec_per_beat
-        end_sec = float(e_beat) * sec_per_beat
-        end_sec = max(end_sec, start_sec + 1e-3)  # avoid zero-length
-        vel = max(1, min(int(vel), 127))
-        inst.notes.append(pretty_midi.Note(velocity=vel, pitch=pitch_num, start=start_sec, end=end_sec))
-
-    pm.instruments.append(inst)
-    pm.write(out_path)
-
-from typing import Dict, List, Tuple, Union
-import pretty_midi
-
-NoteEvent = Tuple[Union[int, str], float, float, int]
 
 def write_multitrack_midi(
     parts: Dict[str, List[NoteEvent]],
     bpm: int,
     out_path: str,
-    programs: Dict[str, int] | None = None,
-    drum_flags: Dict[str, bool] | None = None,
+    programs: Optional[Dict[str, int]] = None,
+    drum_flags: Optional[Dict[str, bool]] = None,
 ) -> str:
     """
-    Write a single MIDI with one track per part.
-    parts: {"melody":[(pitch, start_beat, end_beat, vel), ...], "bass":[...]}
-    programs: optional GM program numbers per part (0..127). Default 0 (Acoustic Grand).
-    drum_flags: optional flags per part; if True, marks the track as drums (channel 10 semantics in DAWs).
-    """
-    pm = pretty_midi.PrettyMIDI()
-    spb = 60.0 / float(bpm)  # seconds per beat
+    Write a multitrack MIDI file from named parts.
 
+    Args:
+        parts: dict like {"melody":[...], "bass":[...], "drums":[...]}
+        bpm: tempo
+        out_path: destination path
+        programs: optional GM programs per part (ignored for drums)
+        drum_flags: e.g., {"drums": True}
+
+    Returns:
+        The path actually written (may differ if fallback name used).
+    """
     programs = programs or {}
     drum_flags = drum_flags or {}
+    pm = pretty_midi.PrettyMIDI()
 
     for name, events in parts.items():
-        program = int(programs.get(name, 0))
         is_drum = bool(drum_flags.get(name, False))
-        inst = pretty_midi.Instrument(program=program, is_drum=is_drum, name=name)
+        program = int(programs.get(name, 0)) if not is_drum else 0
+        instr = pretty_midi.Instrument(program=program, name=name, is_drum=is_drum)
 
-        for pitch, s_beat, e_beat, vel in events:
-            # Convert pitch
-            if isinstance(pitch, str):
-                pnum = int(pretty_midi.note_name_to_number(pitch))
-            else:
-                pnum = int(pitch)
-            # Convert beat -> seconds
-            start = float(s_beat) * spb
-            end = max(float(e_beat) * spb, start + 1e-4)
-            v = max(1, min(int(vel), 127))
-            inst.notes.append(pretty_midi.Note(velocity=v, pitch=pnum, start=start, end=end))
+        for p, s, e, v in events:
+            if isinstance(p, int):
+                _add_note(instr, p, s, e, v, bpm)
+            # If pitch is a string, skip (Or you can add parsing if needed)
 
-        pm.instruments.append(inst)
+        pm.instruments.append(instr)
 
-    pm.write(out_path)
-    return out_path
+    written = _safe_pm_write(pm, out_path)
+    return written
